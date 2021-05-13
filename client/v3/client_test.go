@@ -17,6 +17,7 @@ package clientv3
 import (
 	"context"
 	"fmt"
+	"go.uber.org/zap"
 	"net"
 	"testing"
 	"time"
@@ -29,11 +30,8 @@ import (
 )
 
 func NewClient(t *testing.T, cfg Config) (*Client, error) {
-	client, err := New(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return client.WithLogger(zaptest.NewLogger(t)), nil
+	cfg.Logger = zaptest.NewLogger(t)
+	return New(cfg)
 }
 
 func TestDialCancel(t *testing.T) {
@@ -188,5 +186,15 @@ func TestWithLogger(t *testing.T) {
 	c.WithLogger(nil)
 	if c.lg != nil {
 		t.Errorf("WithLogger should modify *zap.Logger")
+	}
+}
+
+func TestZapWithLogger(t *testing.T) {
+	ctx := context.Background()
+	lg := zap.NewNop()
+	c := NewCtxClient(ctx, WithZapLogger(lg))
+
+	if c.lg != lg {
+		t.Errorf("WithZapLogger should modify *zap.Logger")
 	}
 }

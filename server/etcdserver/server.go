@@ -362,6 +362,13 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 	ci.SetBackend(be)
 	cindex.CreateMetaBucket(be.BatchTx())
 
+	if cfg.ExperimentalBootstrapDefragThresholdMegabytes != 0 {
+		err := maybeDefragBackend(cfg, be)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	defer func() {
 		if err != nil {
 			be.Close()
@@ -472,6 +479,11 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 				cfg.Logger.Panic("failed to recover from snapshot", zap.Error(err))
 			}
 
+			if err = assertNoV2StoreContent(cfg.Logger, st, cfg.V2Deprecation); err != nil {
+				cfg.Logger.Error("illegal v2store content", zap.Error(err))
+				return nil, err
+			}
+
 			cfg.Logger.Info(
 				"recovered v2 store from snapshot",
 				zap.Uint64("snapshot-index", snapshot.Metadata.Index),
@@ -489,6 +501,8 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 				zap.Int64("backend-size-in-use-bytes", s2),
 				zap.String("backend-size-in-use", humanize.Bytes(uint64(s2))),
 			)
+		} else {
+			cfg.Logger.Info("No snapshot found. Recovering WAL from scratch!")
 		}
 
 		if !cfg.ForceNewCluster {
@@ -653,6 +667,23 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 	srv.r.transport = tr
 
 	return srv, nil
+}
+
+// assertNoV2StoreContent -> depending on the deprecation stage, warns or report an error
+// if the v2store contains custom content.
+func assertNoV2StoreContent(lg *zap.Logger, st v2store.Store, deprecationStage config.V2DeprecationEnum) error {
+	metaOnly, err := membership.IsMetaStoreOnly(st)
+	if err != nil {
+		return err
+	}
+	if metaOnly {
+		return nil
+	}
+	if deprecationStage.IsAtLeast(config.V2_DEPR_1_WRITE_ONLY) {
+		return fmt.Errorf("detected disallowed custom content in v2store for stage --v2-deprecation=%s", deprecationStage)
+	}
+	lg.Warn("detected custom v2store content. Etcd v3.5 is the last version allowing to access it using API v2. Please remove the content.")
+	return nil
 }
 
 func (s *EtcdServer) Logger() *zap.Logger {
@@ -1243,6 +1274,10 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	lg.Info("restoring v2 store")
 	if err := s.v2store.Recovery(apply.snapshot.Data); err != nil {
 		lg.Panic("failed to restore v2 store", zap.Error(err))
+	}
+
+	if err := assertNoV2StoreContent(lg, s.v2store, s.Cfg.V2Deprecation); err != nil {
+		lg.Panic("illegal v2store content", zap.Error(err))
 	}
 
 	lg.Info("restored v2 store")
@@ -2579,4 +2614,23 @@ func (s *EtcdServer) IsMemberExist(id types.ID) bool {
 // raftStatus returns the raft status of this etcd node.
 func (s *EtcdServer) raftStatus() raft.Status {
 	return s.r.Node.Status()
+}
+
+func maybeDefragBackend(cfg config.ServerConfig, be backend.Backend) error {
+	size := be.Size()
+	sizeInUse := be.SizeInUse()
+	freeableMemory := uint(size - sizeInUse)
+	thresholdBytes := cfg.ExperimentalBootstrapDefragThresholdMegabytes * 1024 * 1024
+	if freeableMemory < thresholdBytes {
+		cfg.Logger.Info("Skipping defragmentation",
+			zap.Int64("current-db-size-bytes", size),
+			zap.String("current-db-size", humanize.Bytes(uint64(size))),
+			zap.Int64("current-db-size-in-use-bytes", sizeInUse),
+			zap.String("current-db-size-in-use", humanize.Bytes(uint64(sizeInUse))),
+			zap.Uint("experimental-bootstrap-defrag-threshold-bytes", thresholdBytes),
+			zap.String("experimental-bootstrap-defrag-threshold", humanize.Bytes(uint64(thresholdBytes))),
+		)
+		return nil
+	}
+	return be.Defrag()
 }
